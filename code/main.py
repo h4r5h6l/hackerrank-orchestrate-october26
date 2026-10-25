@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
-"""Ghost Data Still Exists - deletion audit agent (stage 1).
+"""Ghost Data Still Exists - deletion audit agent.
 
 Pipeline stages:
 
   0. wiring    - CLI, dataset loading, contract-shaped output      [done]
-  1. classify  - does request_text actually authorise deletion?    [this file]
-  2. identify  - resolve current + historical identifiers, rebuild
-                 the record state at ``audit_at`` from evidence    [TODO]
-  3. policy    - apply deletion_rules.csv, emit FINDING /
-                 REMEDIATION / VERIFICATION steps                  [TODO]
+  1. classify  - does request_text actually authorise deletion?    [done]
+  2. identify  - resolve current + historical identifiers, bounded
+                 by audit_at                                         [done]
+  3. discover  - rebuild the record state at audit_at from the
+                 evidence corpus and apply deletion_rules.csv,
+                 emitting one FINDING per violation                [done]
+  4. remedy    - REMEDIATION + post-remediation VERIFICATION for
+                 incomplete cases; VERIFICATION only for complete  [TODO]
 
 Stage 1 decision (AGENTS.md section 6.5, first bullet): a request that asks
 for access, correction, portability, marketing opt-out, a login reset, a
 profile update, or that explicitly refuses deletion is ``NOT_APPLICABLE`` and
 carries ``steps_json = []``. Everything else authorises deletion and keeps
-being audited in stage 2.
+being audited.
 
-Interim output status: stage 1 can prove that a request authorises deletion
-but not whether the required state holds, so those cases are written as
-``INCOMPLETE`` with ``steps_json = []``. That is a *provisional* stand-in, not
-a finding - stage 3 replaces it. Only ``NOT_APPLICABLE`` rows are final here.
+Stage 3 decides status from evidence, not from ``reported_status``: a case is
+``INCOMPLETE`` when at least one policy violation survives at ``audit_at`` and
+``COMPLETE`` when none does. Step lists currently hold FINDING steps only;
+stage 4 fills in the remediation and verification tails.
 
 Usage:
     python3 code/main.py
     python3 code/main.py --verbose
     python3 code/main.py --out /tmp/check.csv --limit 5
+    python3 code/main.py --dump-findings
     python3 code/main.py --dataset-dir /path/to/dataset --dry-run
 
 Exit codes:
@@ -45,6 +49,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
+import discovery as discovery_module
+import evidence as evidence_module
+import identity as identity_module
+
 CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(CODE_DIR)
 DEFAULT_DATASET_DIR = os.path.join(REPO_ROOT, "dataset")
@@ -53,8 +61,9 @@ DEFAULT_OUTPUT_PATH = os.path.join(REPO_ROOT, "output.csv")
 OUTPUT_COLUMNS = ["case_id", "deletion_status", "steps_json"]
 STATUS_ORDER = ("COMPLETE", "INCOMPLETE", "NOT_APPLICABLE")
 
-# Stage 1 cannot distinguish COMPLETE from INCOMPLETE, so every request that
-# authorises deletion is written with this provisional status (see docstring).
+# What stage 1 writes on its own: it can prove that a request authorises
+# deletion but not whether the required state holds. Kept as the baseline that
+# `evaluate_identity_samples` measures the record audit against.
 PROVISIONAL_STATUS = "INCOMPLETE"
 NOT_APPLICABLE_STEPS = "[]"
 
@@ -409,11 +418,12 @@ def classify_case(case: dict) -> Classification:
 # --------------------------------------------------------------------------
 
 def row_from_classification(classification: Classification) -> dict:
-    """Shape one output row from a stage 1 verdict.
+    """Shape one output row from a stage 1 verdict alone.
 
-    TODO(stage 2): resolve identifiers and rebuild the state at audit_at.
-    TODO(stage 3): apply deletion_rules.csv, then emit FINDING / REMEDIATION /
-    VERIFICATION steps using the 7-field step contract.
+    Only ``NOT_APPLICABLE`` rows are final: the request does not authorise
+    deletion, so there is nothing to audit and ``steps_json`` is ``[]``. Rows
+    that do authorise deletion are built by :func:`row_for_case` instead, from
+    the record audit.
     """
     row = {
         "case_id": classification.case_id,
@@ -429,6 +439,75 @@ def row_from_classification(classification: Classification) -> dict:
 
 def build_rows(requests: Iterable[dict]) -> list[dict]:
     return [row_from_classification(classify_case(case)) for case in requests]
+
+
+# --------------------------------------------------------------------------
+# Stage 3: record audit - what still exists at audit_at?
+# --------------------------------------------------------------------------
+#
+# `system_activity.csv` is a stream of *claims*. A workflow row saying
+# DELETE_RECORD / SUCCESS does not make the record absent, and CHECK_DATA_FLOW
+# saying the connector is enabled is not proof either. So activity rows are
+# read only to explain a finding, never to produce one.
+#
+# The only inputs to a finding are:
+#
+#   * the subject's identifiers, bounded by audit_at (stage 2),
+#   * evidence files captured at or before audit_at (the manifest gate),
+#   * deletion_rules.csv, which says what treatment each category needs.
+#
+# Findings are the FINDING phase of the step contract. Stage 4 turns each one
+# into a remediation action plus the verification that must follow it.
+
+FINDING_ORDER = (
+    "REPORT_REMAINING_RECORD",
+    "REPORT_EXPOSED_PII",
+    "REPORT_ACTIVE_DATA_FLOW",
+    "REPORT_RESTORE_RISK",
+)
+
+
+def build_evidence_index(data: "Dataset") -> "evidence_module.EvidenceIndex":
+    """Parse every evidence file in the manifest exactly once."""
+    manifest = [{"file_id": row["file_id"], "file_path": row["file_path"],
+                 "captured_at": row["captured_at"]}
+                for row in data.evidence_files]
+    return evidence_module.EvidenceIndex(data.dataset_dir, manifest)
+
+
+def audit_cases(requests: Sequence[dict],
+                resolutions: Sequence["identity_module.Resolution"],
+                classifications: Sequence["Classification"],
+                index: "evidence_module.EvidenceIndex",
+                rules: dict[str, str]) -> dict[str, list]:
+    """case_id -> ordered findings, for requests that authorise deletion."""
+    findings_by_case: dict[str, list] = {}
+    for case, resolution, classification in zip(requests, resolutions, classifications):
+        case_id = case["case_id"]
+        if not classification.authorizes_deletion:
+            continue
+        findings_by_case[case_id] = discovery_module.discover_case(
+            case_id, resolution, index, rules)
+    return findings_by_case
+
+
+def steps_from_findings(findings: Sequence) -> list[dict]:
+    """Number findings from 1 so they satisfy the step contract as-is."""
+    return [finding.as_step(step_no) for step_no, finding in enumerate(findings, 1)]
+
+
+def row_for_case(case_id: str, findings: Sequence) -> dict:
+    """One output row: status from findings, FINDING steps numbered from 1."""
+    steps = steps_from_findings(findings)
+    row = {
+        "case_id": case_id,
+        "deletion_status": "INCOMPLETE" if steps else "COMPLETE",
+        "steps_json": json.dumps(steps, ensure_ascii=False, separators=(",", ":")),
+    }
+    assert set(row) == set(OUTPUT_COLUMNS), "output row drifted from contract"
+    if not steps:
+        assert row["deletion_status"] == "COMPLETE"
+    return row
 
 
 # --------------------------------------------------------------------------
@@ -496,6 +575,156 @@ def evaluate_samples(data: "Dataset") -> dict:
         "expected": expected,
         "predicted": predicted,
         "mismatches": mismatches,
+    }
+
+
+def evaluate_identity_samples(data: "Dataset", resolver: "identity_module.IdentityResolver",
+                             status_by_case: dict[str, str] | None = None) -> dict:
+    """Score identity resolution on the public samples, against sample_output.
+
+    Three questions, kept separate so the delta cannot be inflated:
+
+      coverage   - how many sample cases are attributed to a person at all?
+                   The comparison arm is the naive resolver (current snapshot
+                   email only), which is what the pipeline would do without the
+                   audit log.
+      aliases    - on the cases that need history, did we recover every email
+                   version the person has, not just the one quoted?
+      status     - does any of this move deletion_status? It cannot yet: status
+                   still comes from the record audit that stage 2/3 will add.
+                   The number is reported as-is rather than dressed up.
+    """
+    truth = {r["case_id"]: r["deletion_status"] for r in data.sample_output}
+    samples = [s for s in data.sample_deletion_requests if s["case_id"] in truth]
+    if not samples:
+        return {}
+
+    rows = []
+    for sample in samples:
+        resolution = resolver.resolve(sample)
+        baseline = identity_module.baseline_resolve(sample, data.user_identities)
+        aliases = resolution.alias_set(resolution.audit_at)
+        verdict = classify_case(sample)
+        predicted = (verdict.status if verdict.intent == INTENT_NON_DELETION
+                     else PROVISIONAL_STATUS)
+        rows.append({
+            "case_id": resolution.case_id,
+            "truth": truth[resolution.case_id],
+            "predicted": predicted,
+            "outcome": resolution.outcome,
+            "person_id": resolution.person_id,
+            "baseline_person": baseline,
+            "resolved_by": resolution.subject.resolved_by if resolution.subject else "",
+            "n_emails": len(aliases["email"]),
+            "n_phones": len(aliases["phone"]),
+            "needs_history": bool(resolution.subject and resolution.subject.resolved_by != "snapshot"),
+        })
+
+    total = len(rows)
+    resolved = sum(1 for r in rows if r["person_id"])
+    baseline_resolved = sum(1 for r in rows if r["baseline_person"])
+    bad_person = [r["case_id"] for r in rows
+                  if r["baseline_person"] and r["person_id"] and r["baseline_person"] != r["person_id"]]
+    history_cases = [r for r in rows if r["needs_history"] or r["n_emails"] > 1]
+
+    # Which expected sample statuses need history at all, and does status track it?
+    multi = Counter(r["truth"] for r in rows if r["n_emails"] > 1)
+    single = Counter(r["truth"] for r in rows if r["n_emails"] <= 1)
+
+    # Status is decided downstream; `predicted` comes from the record audit when
+    # it is supplied, and falls back to the stage-1 provisional status.
+    predicted_by_case = status_by_case or {}
+    status_hits = sum(1 for r in rows
+                      if predicted_by_case.get(r["case_id"], r["predicted"]) == r["truth"])
+    stage1_status_hits = sum(1 for r in rows if r["predicted"] == r["truth"])
+    # How many INCOMPLETE cases can even be investigated by each arm?
+    baseline_attributable_hits = sum(1 for r in rows
+                                     if r["baseline_person"] and "INCOMPLETE" == r["truth"])
+    current_attributable_hits = sum(1 for r in rows
+                                    if r["person_id"] and "INCOMPLETE" == r["truth"])
+    baseline_version_total = sum(1 for r in rows if r["baseline_person"])
+
+    return {
+        "total": total,
+        "resolved": resolved,
+        "baseline_resolved": baseline_resolved,
+        "disagreements": bad_person,
+        "history_cases": [r["case_id"] for r in history_cases],
+        "baseline_misses": [r["case_id"] for r in rows if not r["baseline_person"]],
+        "multi_status": multi,
+        "single_status": single,
+        "status_hits": status_hits,
+        "stage1_status_hits": stage1_status_hits,
+        "baseline_attributable_hits": baseline_attributable_hits,
+        "current_attributable_hits": current_attributable_hits,
+        "alias_total_current": sum(r["n_emails"] for r in rows),
+        "alias_total_baseline": baseline_version_total,
+    }
+
+
+def evaluate_discovery_samples(data: "Dataset",
+                               resolver: "identity_module.IdentityResolver",
+                               index: "evidence_module.EvidenceIndex",
+                               rules: dict[str, str]) -> dict:
+    """Score the record audit against the FINDING steps in sample_output.csv.
+
+    Two things are measured separately, because they can fail independently:
+
+      findings - exact match on (operation, system_id, resource_id, state,
+                 evidence_id). A finding with the right record but the wrong
+                 citation is not a hit: the citation is the proof.
+      status   - whether "has any finding" reproduces deletion_status. This is
+                 the whole decision rule for stage 3, so a single extra or
+                 missing finding flips a case.
+    """
+    truth_rows = {r["case_id"]: r for r in data.sample_output}
+    samples = [s for s in data.sample_deletion_requests if s["case_id"] in truth_rows]
+    if not samples:
+        return {}
+
+    matched = 0
+    missing_total = 0
+    extra_total = 0
+    status_hits = 0
+    per_case = []
+    missing: list[tuple] = []
+    extra: list[tuple] = []
+
+    for sample in samples:
+        case_id = sample["case_id"]
+        resolution = resolver.resolve(sample)
+        found = discovery_module.discover_case(case_id, resolution, index, rules)
+        expected = [s for s in json.loads(truth_rows[case_id]["steps_json"])
+                    if s.get("phase") == "FINDING"]
+
+        got_keys = {(f.operation, f.system_id, f.resource_id, f.state, f.evidence_id)
+                    for f in found}
+        want_keys = {(s["operation"], s["system_id"], s["resource_id"],
+                      s["state"], s["evidence_id"]) for s in expected}
+
+        matched += len(got_keys & want_keys)
+        for key in sorted(want_keys - got_keys):
+            missing.append((case_id,) + key)
+        for key in sorted(got_keys - want_keys):
+            extra.append((case_id,) + key)
+        missing_total += len(want_keys - got_keys)
+        extra_total += len(got_keys - want_keys)
+
+        predicted = "INCOMPLETE" if found else "COMPLETE"
+        want_status = truth_rows[case_id]["deletion_status"]
+        status_hits += predicted == want_status
+        per_case.append((case_id, want_status, predicted, len(found), len(expected)))
+
+    return {
+        "total_cases": len(samples),
+        "expected_findings": matched + missing_total,
+        "matched": matched,
+        "missing": missing_total,
+        "extra": extra_total,
+        "status_hits": status_hits,
+        "per_case": per_case,
+        "missing_detail": missing,
+        "extra_detail": extra,
     }
 
 
@@ -629,6 +858,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cross-check-intake", action="store_true",
                         help="corroborate NOT_APPLICABLE verdicts against "
                              "privacy-intake CLASSIFY_REQUEST activities")
+    parser.add_argument("--dump-identities", nargs="?", metavar="PATH",
+                        const=os.path.join(REPO_ROOT, "resolved_identities.csv"),
+                        default=None,
+                        help="write case_id, person_id and every linked identity "
+                             "(default path: <repo>/resolved_identities.csv)")
+    parser.add_argument("--dump-findings", nargs="?", metavar="PATH",
+                        const=os.path.join(REPO_ROOT, "discovered_findings.csv"),
+                        default=None,
+                        help="write every per-case finding with its data category, "
+                             "location and citing evidence "
+                             "(default path: <repo>/discovered_findings.csv)")
     return parser.parse_args(argv)
 
 
@@ -647,7 +887,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         requests = requests[:args.limit]
 
     classifications = [classify_case(case) for case in requests]
-    rows = [row_from_classification(c) for c in classifications]
+
+    resolver = identity_module.IdentityResolver(data.user_identities, data.user_audit_log)
+    resolutions = [resolver.resolve(case) for case in requests]
+
+    index = build_evidence_index(data)
+    rules = discovery_module.load_rules(data.deletion_rules)
+    findings_by_case = audit_cases(requests, resolutions, classifications, index, rules)
+
+    rows = []
+    for case, classification in zip(requests, classifications):
+        case_id = case["case_id"]
+        if classification.authorizes_deletion:
+            rows.append(row_for_case(case_id, findings_by_case.get(case_id, [])))
+        else:
+            rows.append(row_from_classification(classification))
     rows.sort(key=lambda r: case_sort_key(r["case_id"]))
     expected_ids = [r["case_id"] for r in rows]
 
@@ -686,6 +940,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             if c.intent == INTENT_NON_DELETION:
                 print(f"  {c.case_id:<10}{c.tier:<34}{c.cue:<32}{c.excerpt[:44]!r}")
 
+    outcome_counts = Counter(r.outcome for r in resolutions)
+    resolved_by = Counter(r.subject.resolved_by for r in resolutions if r.subject)
+    people = {r.person_id for r in resolutions if r.person_id}
+    email_hist = Counter(len(r.alias_set(r.audit_at)["email"]) for r in resolutions if r.subject)
+    phone_hist = Counter(len(r.alias_set(r.audit_at)["phone"]) for r in resolutions if r.subject)
+
+    print()
+    print("identity resolution (user_identities.csv + user_audit_log.csv)")
+    print(f"  distinct people          {len(people):>5}")
+    for line in render_histogram(outcome_counts,
+                                 ("RESOLVED", "UNRESOLVED", "AMBIGUOUS")):
+        print(line)
+    print(f"  matched via              snapshot {resolved_by.get('snapshot', 0)}, "
+          f"history {resolved_by.get('history', 0)}")
+    print(f"  email versions/person    {dict(sorted(email_hist.items()))}")
+    print(f"  phone versions/person    {dict(sorted(phone_hist.items()))}")
+    if resolver.failed_users:
+        print(f"  integrity failures       {len(resolver.failed_users)} "
+              f"(those subjects resolve to UNRESOLVED)")
+
     print()
     print("sample check (sample_deletion_requests.csv vs sample_output.csv)")
     sample = evaluate_samples(data)
@@ -711,6 +985,86 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("  caveat                   the sample set has no NOT_APPLICABLE "
                   "row, so it cannot validate the non-deletion branch")
 
+    print()
+    print("identity check on the public samples "
+          "(baseline = current-snapshot email match only)")
+    status_by_case = {row["case_id"]: row["deletion_status"] for row in rows}
+    id_report = evaluate_identity_samples(data, resolver, status_by_case)
+    if not id_report:
+        print("  skipped: no overlapping sample rows")
+    else:
+        n = id_report["total"]
+        resolved = id_report["resolved"]
+        base = id_report["baseline_resolved"]
+        print(f"  cases attributed         {resolved:>5}/{n}"
+              f"  {resolved / n * 100:5.1f}%   full resolver (snapshot + history)")
+        print(f"  baseline attributable    {base:>5}/{n}"
+              f"  {base / n * 100:5.1f}%   current-snapshot email only")
+        print(f"  coverage delta           {resolved - base:>+5}"
+              f"  {(resolved - base) / n * 100:+5.1f} pp")
+        print(f"  needed history           {len(id_report['history_cases']):>5}"
+              f"   {id_report['history_cases']}")
+        print(f"  baseline misses          {len(id_report['baseline_misses']):>5}"
+              f"   {id_report['baseline_misses']}")
+        print(f"  person disagreements     {len(id_report['disagreements']):>5}"
+              f"   {id_report['disagreements'] or 'none'}")
+        print(f"  email versions recovered {id_report['alias_total_current']:>5}"
+              f"   baseline would recover {id_report['alias_total_baseline']}")
+        print(f"  status by email count    multi-version {dict(id_report['multi_status'])}"
+              f" | single {dict(id_report['single_status'])}")
+        print(f"  deletion_status accuracy {id_report['status_hits']:>5}/{n}"
+              f"  {id_report['status_hits'] / n * 100:5.1f}%"
+              f"   stage 1 alone: {id_report['stage1_status_hits']}/{n}"
+              f" ({(id_report['status_hits'] - id_report['stage1_status_hits']) / n * 100:+.1f} pp)")
+
+    print()
+    print("record audit (evidence_files.csv + dataset/evidence + deletion_rules.csv)")
+    print(f"  evidence files           {len(index.manifest):>5}"
+          f"   parsed {len(index.manifest) - len(index.unparsed) - len(index.empty)},"
+          f" empty {len(index.empty)}, unreadable {len(index.unparsed)}")
+    print(f"  observations             {len(index.observations):>5}"
+          f"   record states extracted from file contents")
+    if index.unparsed:
+        print(f"  unreadable               {index.unparsed}"
+              f"   (binary images: no OCR in this environment)")
+    finding_counts = Counter(f.operation for findings in findings_by_case.values()
+                             for f in findings)
+    cases_with_findings = sum(1 for findings in findings_by_case.values() if findings)
+    print(f"  cases with findings      {cases_with_findings:>5}"
+          f" / {len(findings_by_case)} audited")
+    for operation in FINDING_ORDER:
+        print(f"    {operation:<26}{finding_counts.get(operation, 0):>5}")
+    if (args.verbose and findings_by_case):
+        print()
+        print("  every finding")
+        for case_id in sorted(findings_by_case):
+            for finding in findings_by_case[case_id]:
+                print(f"    {case_id:<9}{finding.operation:<26}{finding.system_id:<20}"
+                      f"{finding.resource_id:<20}{finding.category:<22}"
+                      f"{finding.location:<12}{finding.evidence_id}")
+
+    print()
+    print("finding check on the public samples (FINDING steps of sample_output.csv)")
+    discovery_report = evaluate_discovery_samples(data, resolver, index, rules)
+    if not discovery_report:
+        print("  skipped: no overlapping sample rows")
+    else:
+        expected = discovery_report["expected_findings"]
+        matched = discovery_report["matched"]
+        print(f"  findings matched         {matched:>5}/{expected}"
+              f"  {(matched / expected * 100) if expected else 100:5.1f}%"
+              f"   exact operation+system+resource+state+evidence")
+        print(f"  missing / extra          {discovery_report['missing']:>5}"
+              f" / {discovery_report['extra']}")
+        print(f"  deletion_status          {discovery_report['status_hits']:>5}"
+              f"/{discovery_report['total_cases']}"
+              f"  {(discovery_report['status_hits'] / discovery_report['total_cases'] * 100):5.1f}%"
+              f"   INCOMPLETE iff a finding survives")
+        for case_id, key in discovery_report["missing_detail"][:10]:
+            print(f"    missing {case_id:<9}{key}")
+        for case_id, key in discovery_report["extra_detail"][:10]:
+            print(f"    extra   {case_id:<9}{key}")
+
     if args.cross_check_intake:
         print()
         print("intake cross-check (system_activity CLASSIFY_REQUEST, not a decision input)")
@@ -734,18 +1088,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_output(args.output, rows)
     stats = verify_output(args.output, expected_ids)
 
+    if args.dump_identities:
+        dump_rows = identity_module.resolution_rows(requests, resolver)
+        identity_module.write_resolution_csv(args.dump_identities, dump_rows)
+        print()
+        print(f"wrote {len(dump_rows)} identity row(s) -> {args.dump_identities}")
+
+    if args.dump_findings:
+        finding_rows = []
+        for case_id in sorted(findings_by_case, key=case_sort_key):
+            finding_rows.extend(f.as_row() for f in findings_by_case[case_id])
+        discovery_module.write_findings_csv(args.dump_findings, finding_rows)
+        print()
+        print(f"wrote {len(finding_rows)} finding row(s) -> {args.dump_findings}")
+
     print()
     print(f"wrote {stats['rows']} rows -> {args.output}")
     print(f"  NOT_APPLICABLE : {status_counts.get('NOT_APPLICABLE', 0)} (decided)")
     print(f"  INCOMPLETE     : {status_counts.get('INCOMPLETE', 0)} "
-          f"(provisional - no record audit yet, steps_json empty)")
+          f"(record audit found surviving violations)")
+    print(f"  COMPLETE       : {status_counts.get('COMPLETE', 0)} "
+          f"(no violation found at audit_at; verification steps land in stage 4)")
     if args.verbose:
         print(f"  dataset  : {data.dataset_dir}")
         print(f"  contract : {','.join(OUTPUT_COLUMNS)}")
-        print(f"  evidence : {len(data.evidence_files)} manifest entries "
-              f"(unused until stage 2)")
-        print(f"  rules    : {len(data.deletion_rules)} policy rows "
-              f"(unused until stage 3)")
+        print(f"  evidence : {len(data.evidence_files)} manifest entries, "
+              f"{len(index.observations)} observations")
+        print(f"  rules    : {len(data.deletion_rules)} policy rows applied")
     return 0
 
 

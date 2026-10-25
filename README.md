@@ -39,6 +39,73 @@ python3 code/main.py
 
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
 
+---
+
+## Solution
+
+The agent is a deterministic, offline pipeline in `code/`. No model calls, no
+network: every row is derived from `dataset/` by rule, so repeated runs produce
+byte-identical output.
+
+```bash
+python3 code/main.py                      # write output.csv (518 rows)
+python3 code/main.py --dump-findings      # + discovered_findings.csv
+python3 code/main.py --dump-identities    # + resolved_identities.csv
+python3 code/main.py --verbose            # per-case findings
+python3 -m unittest discover -s code -v   # 85 tests
+```
+
+| Stage | Module | Question it answers |
+| --- | --- | --- |
+| 0 wiring | `main.py` | contract-shaped output, dataset loading |
+| 1 classify | `main.py` | does `request_text` actually authorise deletion? |
+| 2 identify | `identity.py` | which person is this, with which historical emails/phones? |
+| 3 discovery | `evidence.py`, `discovery.py` | what still exists at `audit_at`, and is that a policy violation? |
+| 4 remedy | *(next)* | ordered remediation plus the verification that must follow |
+
+Design rules that shape every row:
+
+- **Evidence is the only proof.** `system_activity.csv` and `reported_status` are
+  claims; a workflow row saying `DELETE_RECORD / SUCCESS` never removes a
+  finding, and `CHECK_DATA_FLOW / SUCCESS` never creates one. Activity rows are
+  used only to explain what was attempted.
+- **The manifest capture time is the gate.** A file captured after a case's
+  `audit_at` did not exist at decision time and is never read for that case, so
+  a later snapshot cannot rewrite history.
+- **Identifiers are exact, never fuzzy.** Current and historical emails/phones
+  come from `user_identities.csv` plus `user_audit_log.csv`, bounded by
+  `audit_at`. Names are never used to join: the corpus contains duplicate
+  display names and near-miss addresses such as `g.silva76.jr@` next to
+  `g.silva76@`.
+- **Latest state wins per record.** For one `(system_id, resource_id)` the
+  newest observation at or before `audit_at` decides, so a later `NOT_FOUND`
+  clears an earlier `FOUND` and a later `PRESENT` reopens a record a writer
+  recreated.
+- **Policy decides, not intuition.** `deletion_rules.csv` maps a category to
+  `DELETE` (the record must be gone → `REPORT_REMAINING_RECORD`), `REDACT` /
+  `ANONYMIZE` (the record may stay but must not be attributable →
+  `REPORT_EXPOSED_PII`), or `RETAIN` (the record must stay; only a restorable
+  backup or an enabled connector is a finding).
+- **Status follows findings.** `INCOMPLETE` iff at least one violation survives
+  at `audit_at`, else `COMPLETE`; `NOT_APPLICABLE` iff the text does not
+  authorise deletion.
+
+Parsed formats: SQLite-compatible `.sql` snapshots (primary / read / regional /
+reporting / failover replicas, including `record_json.document` payloads), JSON
+snapshot bundles and per-service exports (`hits.documents[]`, `profile`),
+`|`-separated ledgers, six different log layouts, and PDFs via `pdftotext`.
+
+Current limitations, stated rather than hidden:
+
+- 11 evidence files are PNG screenshots. There is no OCR in this environment, so
+  they are reported as unreadable instead of being guessed at. Where a case has
+  no timely textual evidence at all - 9 of 518 cases today - the audit finds no
+  violation and therefore reports `COMPLETE` without proof; transcribing those
+  screenshots is the next accuracy win.
+- Steps are FINDING steps only. Stage 4 adds `REMEDIATION` and post-remediation
+  `VERIFICATION`, so `COMPLETE` rows currently carry `steps_json = []`.
+
+---
 
 ## Dataset
 
